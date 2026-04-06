@@ -15,6 +15,12 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! });
 
 // --- types ---
+interface ApplianceIdentification {
+    appliance: string;
+    brand: string;
+    observedSymptoms: string[];
+}
+
 interface DiagnosisResult {
     appliance: string;
     likelyIssue: string;
@@ -91,53 +97,83 @@ function frameToBase64(framePath: string): string {
     return fs.readFileSync(framePath).toString("base64");
 }
 
-async function diagnose(frames: string[], transcript: string): Promise<DiagnosisResult> {
+function buildImageContent(frames: string[]) {
     const selectedFrames = frames.length > 10
         ? frames.filter((_, i) => i % Math.ceil(frames.length / 10) === 0).slice(0, 10)
         : frames;
-
-    const imageContent = selectedFrames.map((f) => ({
+    return selectedFrames.map((f, i) => ({
         type: "image" as const,
         source: {
             type: "base64" as const,
             media_type: "image/jpeg" as const,
             data: frameToBase64(f),
         },
+        // Cache at the last image — everything up to and including it is reused on subsequent calls
+        ...(i === selectedFrames.length - 1 ? { cache_control: { type: "ephemeral" as const } } : {}),
     }));
+}
 
+async function identifyAppliance(frames: string[], transcript: string): Promise<{ result: ApplianceIdentification; usage: Anthropic.Usage }> {
+    const imageContent = buildImageContent(frames);
     const textContent = {
         type: "text" as const,
         text: transcript
-            ? `The user described the issue as follows: "${transcript}"\n\nBased on the video frames and description above, provide a structured appliance diagnosis.`
-            : "Based on the video frames above, provide a structured appliance diagnosis.",
+            ? `The user says: "${transcript}"\n\nIdentify the appliance and list every visible or audible symptom.`
+            : "Identify the appliance and list every visible symptom.",
     };
 
-    const systemPrompt = `You are an expert appliance repair technician. Analyze the provided video frames and any user description to diagnose the appliance issue.
+    const response = await anthropic.messages.create({
+        model: "claude-sonnet-4-6",
+        max_tokens: 512,
+        system: `You are an expert appliance technician. Your only job right now is to identify what appliance is shown and list the symptoms you observe — do NOT diagnose yet.
+
+Respond only with a valid JSON object, no markdown, no preamble:
+{
+  "appliance": "appliance type (e.g. washing machine, refrigerator, dishwasher)",
+  "brand": "brand name if visible, otherwise Unknown",
+  "observedSymptoms": ["symptom 1", "symptom 2"]
+}`,
+        messages: [{ role: "user", content: [...imageContent, textContent] }],
+    });
+
+    const raw = response.content[0].type === "text" ? response.content[0].text : "";
+    return { result: JSON.parse(raw) as ApplianceIdentification, usage: response.usage };
+}
+
+async function diagnose(frames: string[], transcript: string, id: ApplianceIdentification): Promise<{ result: DiagnosisResult; usage: Anthropic.Usage }> {
+    const imageContent = buildImageContent(frames);
+    const symptomList = id.observedSymptoms.map((s) => `• ${s}`).join("\n");
+    const textContent = {
+        type: "text" as const,
+        text: [
+            `Appliance: ${id.appliance} (${id.brand})`,
+            `Observed symptoms:\n${symptomList}`,
+            transcript ? `User description: "${transcript}"` : "",
+            "\nNow provide the full structured diagnosis.",
+        ].filter(Boolean).join("\n"),
+    };
+
+    const systemPrompt = `You are a specialist repair technician for ${id.appliance}s. You have already identified the appliance and its symptoms. Your task is to diagnose the root cause and advise the user.
 
 Respond only with a valid JSON object in this exact shape, no markdown, no preamble:
 {
-  "appliance": "type and brand if visible",
-  "likelyIssue": "1-2 sentence summary",
-  "possibleCauses": ["cause 1", "cause 2", "cause 3"],
+  "appliance": "full description including brand",
+  "likelyIssue": "1-2 sentence summary of the most probable fault",
+  "possibleCauses": ["most likely cause", "second possibility", "third possibility"],
   "severity": "Low" | "Medium" | "High",
-  "recommendedAction": "DIY steps if safe, or advise calling a professional",
-  "safetyWarning": "any electrical/gas/water hazards, or None"
+  "recommendedAction": "step-by-step DIY fix if safe, otherwise advise calling a professional",
+  "safetyWarning": "specific electrical/gas/water hazards for this appliance, or None"
 }`;
 
     const response = await anthropic.messages.create({
         model: "claude-sonnet-4-6",
         max_tokens: 1024,
         system: systemPrompt,
-        messages: [
-            {
-                role: "user",
-                content: [...imageContent, textContent],
-            },
-        ],
+        messages: [{ role: "user", content: [...imageContent, textContent] }],
     });
 
     const raw = response.content[0].type === "text" ? response.content[0].text : "";
-    return JSON.parse(raw) as DiagnosisResult;
+    return { result: JSON.parse(raw) as DiagnosisResult, usage: response.usage };
 }
 
 function printDiagnosis(d: DiagnosisResult): void {
@@ -178,8 +214,15 @@ async function main(): Promise<void> {
             console.log("   No speech detected");
         }
 
-        console.log("⏳ Analyzing with Claude...");
-        const diagnosis = await diagnose(frames, transcript);
+        console.log("⏳ Identifying appliance...");
+        const { result: id, usage: usage1 } = await identifyAppliance(frames, transcript);
+        console.log(`   ${id.appliance} (${id.brand}) — ${id.observedSymptoms.length} symptom(s) detected`);
+        console.log(`   Tokens: ${usage1.input_tokens} in / ${usage1.output_tokens} out (${usage1.cache_creation_input_tokens ?? 0} cached)`);
+
+        console.log("⏳ Diagnosing...");
+        const { result: diagnosis, usage: usage2 } = await diagnose(frames, transcript, id);
+        console.log(`   Tokens: ${usage2.input_tokens} in / ${usage2.output_tokens} out (${usage2.cache_read_input_tokens ?? 0} from cache)`);
+        console.log(`   Total:  ${usage1.input_tokens + usage2.input_tokens} in / ${usage1.output_tokens + usage2.output_tokens} out`);
         printDiagnosis(diagnosis);
     } catch (err) {
         console.error("\n❌ Error:", err instanceof Error ? err.message : err);
