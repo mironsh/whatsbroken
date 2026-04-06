@@ -5,8 +5,10 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
+import ffmpegPath from "ffmpeg-static";
 
-dotenv.config();
+dotenv.config({ path: ".env.local" });
+ffmpeg.setFfmpegPath(ffmpegPath!);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
@@ -47,7 +49,7 @@ function cleanup(): void {
 
 function extractFrames(videoPath: string, outputDir: string, fps = 0.33): Promise<string[]> {
     return new Promise((resolve, reject) => {
-        const pattern = path.join(outputDir, "frame-%04d.jpg");
+        const pattern = outputDir + "/frame-%04d.jpg";
         ffmpeg(videoPath)
             .outputOptions([`-vf fps=${fps}`, "-q:v 3"])
             .output(pattern)
@@ -59,7 +61,7 @@ function extractFrames(videoPath: string, outputDir: string, fps = 0.33): Promis
                     .map((f) => path.join(outputDir, f));
                 resolve(frames);
             })
-            .on("error", reject)
+            .on("error", (err) => reject(err))
             .run();
     });
 }
