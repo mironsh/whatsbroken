@@ -21,6 +21,11 @@ interface ApplianceIdentification {
     observedSymptoms: string[];
 }
 
+interface RepairCost {
+    diy: string;
+    professional: string;
+}
+
 interface DiagnosisResult {
     appliance: string;
     likelyIssue: string;
@@ -28,6 +33,8 @@ interface DiagnosisResult {
     severity: "Low" | "Medium" | "High";
     recommendedAction: string;
     safetyWarning: string;
+    estimatedRepairCost: RepairCost;
+    clarifyingQuestions: string[];
 }
 
 // --- args ---
@@ -162,17 +169,20 @@ Respond only with a valid JSON object in this exact shape, no markdown, no pream
   "possibleCauses": ["most likely cause", "second possibility", "third possibility"],
   "severity": "Low" | "Medium" | "High",
   "recommendedAction": "step-by-step DIY fix if safe, otherwise advise calling a professional",
-  "safetyWarning": "specific electrical/gas/water hazards for this appliance, or None"
+  "safetyWarning": "specific electrical/gas/water hazards for this appliance, or None",
+  "estimatedRepairCost": { "diy": "e.g. $0-20 (part name)", "professional": "e.g. $80-150" },
+  "clarifyingQuestions": ["question that would increase diagnostic confidence", "..."] or [] if diagnosis is already certain
 }`;
 
     const response = await anthropic.messages.create({
         model: "claude-sonnet-4-6",
-        max_tokens: 1024,
+        max_tokens: 10000,
+        thinking: { type: "enabled", budget_tokens: 8000 },
         system: systemPrompt,
         messages: [{ role: "user", content: [...imageContent, textContent] }],
     });
 
-    const raw = response.content[0].type === "text" ? response.content[0].text : "";
+    const raw = response.content.find((b) => b.type === "text")?.text ?? "";
     return { result: JSON.parse(raw) as DiagnosisResult, usage: response.usage };
 }
 
@@ -188,7 +198,13 @@ function printDiagnosis(d: DiagnosisResult): void {
     d.possibleCauses.forEach((c) => console.log(`   • ${c}`));
     console.log(`⚠️  Severity:    ${severityColor}${d.severity}${reset}`);
     console.log(`🛠️  Action:      ${d.recommendedAction}`);
-    console.log(`🚨 Safety:      ${d.safetyWarning}\n`);
+    console.log(`💰 Cost:        DIY ${d.estimatedRepairCost.diy} · Professional ${d.estimatedRepairCost.professional}`);
+    console.log(`🚨 Safety:      ${d.safetyWarning}`);
+    if (d.clarifyingQuestions.length > 0) {
+        console.log(`\n❓ To improve this diagnosis, answer:`);
+        d.clarifyingQuestions.forEach((q) => console.log(`   • ${q}`));
+    }
+    console.log();
 }
 
 // --- main ---
@@ -219,9 +235,9 @@ async function main(): Promise<void> {
         console.log(`   ${id.appliance} (${id.brand}) — ${id.observedSymptoms.length} symptom(s) detected`);
         console.log(`   Tokens: ${usage1.input_tokens} in / ${usage1.output_tokens} out (${usage1.cache_creation_input_tokens ?? 0} cached)`);
 
-        console.log("⏳ Diagnosing...");
+        console.log("⏳ Diagnosing (extended thinking)...");
         const { result: diagnosis, usage: usage2 } = await diagnose(frames, transcript, id);
-        console.log(`   Tokens: ${usage2.input_tokens} in / ${usage2.output_tokens} out (${usage2.cache_read_input_tokens ?? 0} from cache)`);
+        console.log(`   Tokens: ${usage2.input_tokens} in / ${usage2.output_tokens} out (${usage2.cache_read_input_tokens ?? 0} from cache, ${(usage2 as any).thinking_input_tokens ?? 0} thinking)`);
         console.log(`   Total:  ${usage1.input_tokens + usage2.input_tokens} in / ${usage1.output_tokens + usage2.output_tokens} out`);
         printDiagnosis(diagnosis);
     } catch (err) {
